@@ -109,7 +109,7 @@ def generate(
         .repeat_interleave(block_length, dim=1)
         .unsqueeze(0)
         .unsqueeze(0)
-    ).to(torch.bfloat16)
+    ).to(model.dtype)
 
     position_ids = torch.arange(total_length, device=model.device).unsqueeze(0)
     x = torch.full((1, total_length), mask_id, dtype=torch.long, device=model.device)

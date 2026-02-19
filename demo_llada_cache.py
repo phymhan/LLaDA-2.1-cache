@@ -116,7 +116,7 @@ def generate_cached(
         .repeat_interleave(block_length, dim=1)
         .unsqueeze(0)
         .unsqueeze(0)
-    ).to(torch.bfloat16)
+    ).to(model.dtype)
 
     position_ids = torch.arange(total_length, device=model.device).unsqueeze(0)
     x = torch.full((1, total_length), mask_id, dtype=torch.long, device=model.device)
@@ -224,24 +224,27 @@ def generate_cached(
             if active_block_mask.sum() == 0 and not editing_transfer_index.any():
                 break
 
-        # ── Commit finalized block: store KV for this block in cache ──
-        model(
-            cur_x,
-            attention_mask=None,
-            position_ids=cur_position_ids,
-            past_key_values=past_key_values,
-            use_cache=True,
-            store_kv=True,
-        )
-
         x[:, block_start_pos:block_end_pos] = cur_x
 
+        # Check if we should stop before committing KV (commit is only needed
+        # if there are subsequent blocks that will read from the cache).
         if eos_early_stop:
             generated_part = x[0, prompt_length:block_end_pos]
             if (generated_part == mask_id).sum() == 0:
                 eos_positions = (generated_part == eos_id).nonzero(as_tuple=True)[0]
                 if len(eos_positions) > 0:
                     break
+
+        if num_block < num_blocks - 1:
+            # ── Commit finalized block: store KV for this block in cache ──
+            model(
+                cur_x,
+                attention_mask=None,
+                position_ids=cur_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                store_kv=True,
+            )
 
     # ── Extract generated tokens ──
     generated_answer = x[:, : prompt_length + gen_length]
