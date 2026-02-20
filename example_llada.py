@@ -4,7 +4,7 @@ Minimal LLaDA2.1 inference example.
 Usage:
   python example_llada.py
   python example_llada.py --model inclusionAI/LLaDA2.1-mini --prompt "Hello!"
-  python example_llada.py --prompt-file path/to/prompt.txt --gen-length 1024
+  python example_llada.py --prompt_file path/to/prompt.txt --gen_length 1024
 """
 
 import argparse
@@ -85,40 +85,32 @@ def main(args):
     t0 = time.perf_counter()
     stats = None
 
+    # Common kwargs shared by both generate functions
+    generate_fn_kwargs = dict(
+        model=model,
+        inputs=input_ids,
+        temperature=args.temperature,
+        block_length=args.block_length,
+        steps=args.steps,
+        gen_length=args.gen_length,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        eos_early_stop=args.eos_early_stop,
+        eos_id=args.eos_id,
+        mask_id=args.mask_id,
+        threshold=args.threshold,
+        editing_threshold=args.editing_threshold,
+    )
+
     if args.generate_fn == "cached":
-        generated_tokens = generate_cached(
-            model=model,
-            inputs=input_ids,
-            temperature=args.temperature,
-            block_length=args.block_length,
-            steps=args.steps,
-            gen_length=args.gen_length,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            eos_early_stop=args.eos_early_stop,
+        generate_fn_kwargs.update(
             minimal_topk=args.minimal_topk,
-            threshold=args.threshold,
-            editing_threshold=args.editing_threshold,
             max_post_steps=args.max_post_steps,
-            eos_id=args.eos_id,
-            mask_id=args.mask_id,
             num_to_transfer=args.num_to_transfer,
         )
+        generated_tokens = generate_cached(**generate_fn_kwargs)
     elif args.generate_fn == "ssd_policy":
-        result = generate_ssd_policy(
-            model=model,
-            inputs=input_ids,
-            temperature=args.temperature,
-            block_length=args.block_length,
-            steps=args.steps,
-            gen_length=args.gen_length,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            eos_early_stop=args.eos_early_stop,
-            eos_id=args.eos_id,
-            mask_id=args.mask_id,
-            threshold=args.threshold,
-            editing_threshold=args.editing_threshold,
+        generate_fn_kwargs.update(
             min_ssd_span_length=args.min_ssd_span_length,
             legacy_ssd_span_strategy=args.legacy_ssd_span_strategy,
             ssd_ratio_tempering_factor=args.ssd_ratio_tempering_factor,
@@ -133,6 +125,7 @@ def main(args):
             ssd_confidence_margin_threshold=args.ssd_confidence_margin_threshold,
             ssd_entropy_temperature=args.ssd_entropy_temperature,
         )
+        result = generate_ssd_policy(**generate_fn_kwargs)
         if args.return_forward_stats:
             generated_tokens, stats = result
         else:
@@ -201,49 +194,49 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minimal LLaDA2.1 generation example")
     parser.add_argument("--model", type=str, default="inclusionAI/LLaDA2.1-mini", help="HuggingFace model repo or local path")
     parser.add_argument("-p", "--prompt", type=str, default=None, help="User prompt text. If omitted, read from stdin/default.")
-    parser.add_argument("--prompt-file", type=str, default=None, help="Path to a file containing the prompt.")
+    parser.add_argument("--prompt_file", type=str, default=None, help="Path to a file containing the prompt.")
     parser.add_argument("--dtype", type=str, choices=["bfloat16", "float16", "float32"], default="bfloat16", help="Torch dtype for model.")
-    parser.add_argument("--device-map", type=str, default="auto", help="Transformers device_map value.")
-    parser.add_argument("--gen-length", type=int, default=512, help="Number of tokens to generate.")
-    parser.add_argument("--block-length", type=int, default=32, help="Block length used by model.generate.")
+    parser.add_argument("--device_map", type=str, default="auto", help="Transformers device_map value.")
+    parser.add_argument("--gen_length", type=int, default=512, help="Number of tokens to generate.")
+    parser.add_argument("--block_length", type=int, default=32, help="Block length used by model.generate.")
     parser.add_argument("--steps", type=int, default=32, help="Refinement steps per block.")
-    parser.add_argument("--top-p", type=float, default=None, help="Optional nucleus sampling threshold.")
-    parser.add_argument("--top-k", type=int, default=None, help="Optional top-k sampling cutoff.")
-    parser.add_argument("--minimal-topk", type=int, default=1, help="Caps effective steps via gen_length // minimal_topk.")
+    parser.add_argument("--top_p", type=float, default=None, help="Optional nucleus sampling threshold.")
+    parser.add_argument("--top_k", type=int, default=None, help="Optional top-k sampling cutoff.")
+    parser.add_argument("--minimal_topk", type=int, default=1, help="Caps effective steps via gen_length // minimal_topk.")
     parser.add_argument("--threshold", type=float, default=0.5, help="Acceptance threshold for generation.")
-    parser.add_argument("--editing-threshold", type=float, default=0.0, help="Editing threshold for generation.")
-    parser.add_argument("--max-post-steps", type=int, default=16, help="Post-mask global editing steps per block.")
-    parser.add_argument("--eos-id", type=int, default=156892, help="EOS token id for early stopping.")
-    parser.add_argument("--mask-id", type=int, default=156895, help="Mask token id used during iterative refinement.")
-    parser.add_argument("--num-to-transfer", type=int, default=1, help="Minimum number of masked positions to resolve per iteration.")
+    parser.add_argument("--editing_threshold", type=float, default=0.0, help="Editing threshold for generation.")
+    parser.add_argument("--max_post_steps", type=int, default=16, help="Post-mask global editing steps per block.")
+    parser.add_argument("--eos_id", type=int, default=156892, help="EOS token id for early stopping.")
+    parser.add_argument("--mask_id", type=int, default=156895, help="Mask token id used during iterative refinement.")
+    parser.add_argument("--num_to_transfer", type=int, default=1, help="Minimum number of masked positions to resolve per iteration.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
-    parser.add_argument("--eos-early-stop", type=str2bool, default=True, help="Enable/disable early stopping at EOS.")
+    parser.add_argument("--eos_early_stop", type=str2bool, default=True, help="Enable/disable early stopping at EOS.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
 
     # Generation function selection
-    parser.add_argument("--generate-fn", type=str, choices=["cached", "ssd_policy"], default="cached", help="Generation function to use.")
+    parser.add_argument("--generate_fn", type=str, choices=["cached", "ssd_policy"], default="cached", help="Generation function to use.")
 
-    # SSD-specific arguments (used when --generate-fn=ssd_policy)
-    parser.add_argument("--min-ssd-span-length", type=int, default=1, help="Minimum mask span length to trigger 2L verification.")
-    parser.add_argument("--legacy-ssd-span-strategy", type=str2bool, default=False, help="If set, mask_span_length policy also checks high-confidence count before skipping verification.")
-    parser.add_argument("--ssd-ratio-tempering-factor", type=float, default=1.0, help="Exponent applied to SSD acceptance ratios.")
-    parser.add_argument("--return-forward-stats", type=str2bool, default=False, help="Return and print forward statistics (SSD only).")
+    # SSD-specific arguments (used when --generate_fn=ssd_policy)
+    parser.add_argument("--min_ssd_span_length", type=int, default=1, help="Minimum mask span length to trigger 2L verification.")
+    parser.add_argument("--legacy_ssd_span_strategy", type=str2bool, default=False, help="If set, mask_span_length policy also checks high-confidence count before skipping verification.")
+    parser.add_argument("--ssd_ratio_tempering_factor", type=float, default=1.0, help="Exponent applied to SSD acceptance ratios.")
+    parser.add_argument("--return_forward_stats", type=str2bool, default=False, help="Return and print forward statistics (SSD only).")
 
     # SSD verification policy
-    parser.add_argument("--do-verify-policy", type=str, default="mask_span_length",
+    parser.add_argument("--do_verify_policy", type=str, default="mask_span_length",
                         choices=["mask_span_length", "score_threshold", "score_hysteresis"],
                         help="Policy for deciding whether to run the 2L verifier.")
-    parser.add_argument("--do-verify-score-threshold", type=float, default=0.0, help="Threshold for score_threshold policy.")
-    parser.add_argument("--hysteresis-threshold-on", type=float, default=0.0, help="Turn-on threshold for score_hysteresis policy.")
-    parser.add_argument("--hysteresis-threshold-off", type=float, default=-1.0, help="Turn-off threshold for score_hysteresis policy.")
-    parser.add_argument("--do-verify-score-type", type=str, default="difference_dynamic", choices=["difference_dynamic", "difference_static"],
+    parser.add_argument("--do_verify_score_threshold", type=float, default=0.0, help="Threshold for score_threshold policy.")
+    parser.add_argument("--hysteresis_threshold_on", type=float, default=0.0, help="Turn-on threshold for score_hysteresis policy.")
+    parser.add_argument("--hysteresis_threshold_off", type=float, default=-1.0, help="Turn-off threshold for score_hysteresis policy.")
+    parser.add_argument("--do_verify_score_type", type=str, default="difference_dynamic", choices=["difference_dynamic", "difference_static"],
                         help="Score function for score-based verify policies.")
-    parser.add_argument("--score-penalty-coef", type=float, default=2.0, help="Penalty coefficient c in score computation.")
-    parser.add_argument("--token-acceptance-estimator", type=str, default="hard_margin_threshold",
+    parser.add_argument("--score_penalty_coef", type=float, default=2.0, help="Penalty coefficient c in score computation.")
+    parser.add_argument("--token_acceptance_estimator", type=str, default="hard_margin_threshold",
                         choices=["hard_margin_threshold", "soft_entropy_negexp", "soft_renyi_2_entropy"],
                         help="Estimator for per-token acceptance probability.")
-    parser.add_argument("--ssd-confidence-margin-threshold", type=float, default=0.05, help="Margin threshold for hard_margin_threshold estimator.")
-    parser.add_argument("--ssd-entropy-temperature", type=float, default=1.0, help="Temperature for soft_entropy_negexp estimator.")
+    parser.add_argument("--ssd_confidence_margin_threshold", type=float, default=0.05, help="Margin threshold for hard_margin_threshold estimator.")
+    parser.add_argument("--ssd_entropy_temperature", type=float, default=1.0, help="Temperature for soft_entropy_negexp estimator.")
 
     args = parser.parse_args()
     main(args)
