@@ -337,6 +337,116 @@ def _reject_resample_from_delta(q_probs_1d, p_probs_1d):
     return torch.multinomial(delta, num_samples=1).squeeze(0)
 
 
+def _estimate_token_acceptance_probs(
+    estimator,
+    sampled_token_confidence,
+    span_logits,
+    temperature,
+    top_k,
+    top_p,
+    ssd_confidence_margin_threshold=0.05,
+    ssd_entropy_temperature=1.0,
+):
+    """
+    Estimate per-token acceptance probability alpha_i for SSD.
+
+    Args:
+        estimator: One of "hard_margin_threshold", "soft_entropy_negexp", "soft_renyi_2_entropy"
+        sampled_token_confidence: (S,) confidence of sampled tokens
+        span_logits: (S, V) logits at span positions
+        temperature, top_k, top_p: sampling transforms for computing probs
+        ssd_confidence_margin_threshold: threshold for hard_margin_threshold
+        ssd_entropy_temperature: temperature for soft_entropy_negexp
+
+    Returns:
+        (S,) tensor of estimated acceptance probabilities
+    """
+    probs = _probs_from_logits(
+        span_logits, temperature=temperature, top_k=top_k, top_p=top_p
+    )  # (S, V)
+
+    if estimator == "hard_margin_threshold":
+        if probs.shape[-1] >= 2:
+            top2_vals = torch.topk(probs, k=2, dim=-1).values
+            confidence_margin = top2_vals[:, 0] - top2_vals[:, 1]
+        else:
+            confidence_margin = probs[:, 0]
+        return (confidence_margin > ssd_confidence_margin_threshold).to(
+            dtype=sampled_token_confidence.dtype
+        )
+
+    if estimator == "soft_entropy_negexp":
+        if probs.shape[-1] <= 1:
+            normalized_entropy = torch.zeros(
+                probs.shape[0], device=probs.device, dtype=probs.dtype
+            )
+        else:
+            entropy = -(probs * probs.clamp_min(1e-12).log()).sum(dim=-1)
+            normalized_entropy = entropy / torch.log(
+                torch.tensor(float(probs.shape[-1]), device=probs.device, dtype=probs.dtype)
+            )
+        return torch.exp(-ssd_entropy_temperature * normalized_entropy)
+
+    if estimator == "soft_renyi_2_entropy":
+        return (probs ** 2).sum(dim=-1).clamp(0.0, 1.0)
+
+    raise ValueError(f"Unknown token acceptance estimator: {estimator}")
+
+
+def _estimate_expected_accepted_tokens(alpha):
+    """E[K] = sum_{k=1}^{L} prod_{i=1}^{k} alpha_i for a token span."""
+    if alpha.numel() == 0:
+        return 0.0
+    alpha = alpha.clamp(0.0, 1.0)
+    return float(torch.cumprod(alpha, dim=0).sum().item())
+
+
+def _compute_do_verify_score(
+    score_type,
+    span_logits,
+    sampled_token_confidence,
+    mask_index,
+    x0_p,
+    threshold,
+    token_acceptance_estimator,
+    temperature,
+    top_k,
+    top_p,
+    ssd_confidence_margin_threshold,
+    ssd_entropy_temperature,
+    score_penalty_coef,
+):
+    """
+    Compute score for score-based verify policies.
+
+    score_type "difference_dynamic": E[K] - c * num_high_confidence
+    score_type "difference_static":  E[K] - c
+    """
+    span_alpha = _estimate_token_acceptance_probs(
+        estimator=token_acceptance_estimator,
+        sampled_token_confidence=sampled_token_confidence,
+        span_logits=span_logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        ssd_confidence_margin_threshold=ssd_confidence_margin_threshold,
+        ssd_entropy_temperature=ssd_entropy_temperature,
+    )
+    expected_accepted_tokens = _estimate_expected_accepted_tokens(span_alpha)
+    c = float(score_penalty_coef)
+
+    if score_type == "difference_dynamic":
+        confidence = torch.where(mask_index, x0_p, -torch.inf)
+        high_conf_mask = confidence[0] > threshold
+        num_high_confidence = int(high_conf_mask.sum().item())
+        return expected_accepted_tokens - c * num_high_confidence
+
+    if score_type == "difference_static":
+        return expected_accepted_tokens - c
+
+    raise ValueError(f"Unknown do_verify_score_type: {score_type}")
+
+
 @torch.no_grad()
 def generate_ssd_policy(
     model,
@@ -353,8 +463,21 @@ def generate_ssd_policy(
     threshold=0.5,
     editing_threshold=0.0,
     min_ssd_span_length=1,
+    legacy_ssd_span_strategy=False,
     ssd_ratio_tempering_factor=1.0,
     return_forward_stats=False,
+    # Policy selection
+    do_verify_policy="mask_span_length",
+    # Score-based policy parameters
+    do_verify_score_threshold=0.0,
+    hysteresis_threshold_on=0.0,
+    hysteresis_threshold_off=-1.0,
+    do_verify_score_type="difference_dynamic",
+    score_penalty_coef=2.0,
+    # Token acceptance estimator parameters
+    token_acceptance_estimator="hard_margin_threshold",
+    ssd_confidence_margin_threshold=0.05,
+    ssd_entropy_temperature=1.0,
 ):
     """
     Generate text using Self-Speculative Decoding (SSD) with KV cache.
@@ -368,9 +491,12 @@ def generate_ssd_policy(
     when verification is always skipped (e.g. min_ssd_span_length is very large),
     the fallback is equivalent to generate_cached's mask-filling + editing.
 
-    The mask_span_length policy skips verification when the first contiguous mask
-    span is shorter than min_ssd_span_length (and enough high-confidence tokens
-    are available), falling back to confidence-based unmasking.
+    Verification policies:
+    - mask_span_length: skip verification when the first contiguous mask span
+      is shorter than min_ssd_span_length
+    - score_threshold: skip verification when the expected-acceptance score
+      falls below do_verify_score_threshold
+    - score_hysteresis: like score_threshold but with hysteresis (on/off thresholds)
 
     Args:
         model: LLaDA2MoeModelLM instance
@@ -387,8 +513,19 @@ def generate_ssd_policy(
         threshold: Confidence threshold for unmasking tokens (mask-filling)
         editing_threshold: Confidence threshold for editing non-masked tokens
         min_ssd_span_length: Minimum mask span length to trigger 2L verification
+        legacy_ssd_span_strategy: If True, mask_span_length policy also requires
+            enough high-confidence tokens before skipping verification
         ssd_ratio_tempering_factor: Exponent applied to acceptance ratios
         return_forward_stats: If True, return (tokens, stats_dict)
+        do_verify_policy: Policy for deciding whether to run the 2L verifier
+        do_verify_score_threshold: Threshold for score_threshold policy
+        hysteresis_threshold_on: Turn-on threshold for score_hysteresis policy
+        hysteresis_threshold_off: Turn-off threshold for score_hysteresis policy
+        do_verify_score_type: Score function ("difference_dynamic" or "difference_static")
+        score_penalty_coef: Penalty coefficient c in score computation
+        token_acceptance_estimator: Estimator for per-token acceptance probability
+        ssd_confidence_margin_threshold: Margin threshold for hard_margin_threshold
+        ssd_entropy_temperature: Temperature for soft_entropy_negexp
 
     Returns:
         tensor: Generated token IDs (prompt + generated up to first EOS).
@@ -421,6 +558,10 @@ def generate_ssd_policy(
     decoding_order = [] if return_forward_stats else None
 
     num_transfer_tokens = _get_num_transfer_tokens(block_length, steps)
+
+    hysteresis_state = None
+    if do_verify_policy == "score_hysteresis":
+        hysteresis_state = {"is_on": False}
 
     # ── Prefill stage ──
     if prefill_length > 0:
@@ -489,7 +630,7 @@ def generate_ssd_policy(
             decoded_this_step = 0
             transfer_index = torch.zeros_like(cur_x, dtype=torch.bool)
             update_tokens = cur_x.clone()
-            step_decoding_positions = [] if return_forward_stats else None
+            step_info = {"edit": [], "unmask": []} if return_forward_stats else None
 
             # ── Editing: replace non-mask, non-prompt tokens (before SSD) ──
             editing_transfer_index = torch.zeros_like(x0, dtype=torch.bool)
@@ -507,6 +648,14 @@ def generate_ssd_policy(
                 transfer_index |= editing_transfer_index
                 update_tokens[editing_transfer_index] = x0[editing_transfer_index]
 
+                if return_forward_stats:
+                    base_abs = block_start
+                    for pos in editing_transfer_index[0].nonzero(as_tuple=True)[0].tolist():
+                        abs_pos = base_abs + pos
+                        old_tok = int(old_block_tokens[0, pos].item())
+                        new_tok = int(x0[0, pos].item())
+                        step_info["edit"].append((abs_pos, old_tok, new_tok))
+
             # Draft-fill all masks (and include edits) for verifier first half
             input_seq_ver_first = cur_x.clone()
             if editing_transfer_index.any():
@@ -519,14 +668,49 @@ def generate_ssd_policy(
             span_rel = spans_rel[0] if len(spans_rel) > 0 else []
             span_rel_t = torch.tensor(span_rel, device=cur_x.device, dtype=torch.long)
 
-            # ── mask_span_length policy: decide whether to verify ──
+            # ── Policy: decide whether to verify ──
             do_verify = True
-            if len(span_rel) < min_ssd_span_length:
-                # Skip verification if span is short and we have enough confident tokens
-                confidence = torch.where(mask_index, x0_p, -torch.inf)
-                high_conf_count = int((confidence[0] > threshold).sum().item())
-                if high_conf_count >= min(min_ssd_span_length, int(mask_index.sum().item())):
-                    do_verify = False
+            if do_verify_policy == "mask_span_length":
+                if len(span_rel) < min_ssd_span_length:
+                    if not legacy_ssd_span_strategy:
+                        do_verify = False
+                    else:
+                        # Legacy: also require enough high-confidence tokens
+                        confidence = torch.where(mask_index, x0_p, -torch.inf)
+                        high_conf_count = int((confidence[0] > threshold).sum().item())
+                        if high_conf_count >= min(min_ssd_span_length, int(mask_index.sum().item())):
+                            do_verify = False
+            elif do_verify_policy in ("score_threshold", "score_hysteresis"):
+                do_verify_score = float("-inf")
+                if span_rel_t.numel() > 0:
+                    span_logits = logits[0].index_select(0, span_rel_t)  # (S, V)
+                    do_verify_score = _compute_do_verify_score(
+                        score_type=do_verify_score_type,
+                        span_logits=span_logits,
+                        sampled_token_confidence=x0_p[0, span_rel_t].clamp(0.0, 1.0),
+                        mask_index=mask_index,
+                        x0_p=x0_p,
+                        threshold=threshold,
+                        token_acceptance_estimator=token_acceptance_estimator,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        ssd_confidence_margin_threshold=ssd_confidence_margin_threshold,
+                        ssd_entropy_temperature=ssd_entropy_temperature,
+                        score_penalty_coef=score_penalty_coef,
+                    )
+                if do_verify_policy == "score_threshold":
+                    if do_verify_score < do_verify_score_threshold:
+                        do_verify = False
+                else:  # score_hysteresis
+                    is_on = hysteresis_state["is_on"]
+                    if is_on:
+                        do_verify = not (do_verify_score < hysteresis_threshold_off)
+                    else:
+                        do_verify = bool(do_verify_score > hysteresis_threshold_on)
+                    hysteresis_state["is_on"] = bool(do_verify)
+            else:
+                raise ValueError(f"Unknown do_verify_policy: {do_verify_policy}")
 
             if do_verify and len(span_rel) > 0:
                 L = int(cur_x.shape[1])
@@ -602,9 +786,9 @@ def generate_ssd_policy(
                         for r in update_rel:
                             abs_pos = base_abs + int(r)
                             if first_reject is not None and r == span_rel[first_reject]:
-                                step_decoding_positions.append(float(abs_pos) + 0.5)
+                                step_info["unmask"].append(float(abs_pos) + 0.5)
                             else:
-                                step_decoding_positions.append(int(abs_pos))
+                                step_info["unmask"].append(int(abs_pos))
 
             # ── Fallback mask-filling: if SSD didn't decode enough ──
             if decoded_this_step < min_k:
@@ -630,13 +814,13 @@ def generate_ssd_policy(
                 if return_forward_stats:
                     base_abs = block_start
                     for r in fallback_index[0].nonzero(as_tuple=True)[0].tolist():
-                        step_decoding_positions.append(-int(base_abs + r))
+                        step_info["unmask"].append(-int(base_abs + r))
 
             # Apply updates
             cur_x[transfer_index] = update_tokens[transfer_index]
 
             if return_forward_stats:
-                decoding_order.append(step_decoding_positions)
+                decoding_order.append(step_info)
 
         x[:, block_start:block_end] = cur_x
 

@@ -120,8 +120,18 @@ def main(args):
             threshold=args.threshold,
             editing_threshold=args.editing_threshold,
             min_ssd_span_length=args.min_ssd_span_length,
+            legacy_ssd_span_strategy=args.legacy_ssd_span_strategy,
             ssd_ratio_tempering_factor=args.ssd_ratio_tempering_factor,
             return_forward_stats=args.return_forward_stats,
+            do_verify_policy=args.do_verify_policy,
+            do_verify_score_threshold=args.do_verify_score_threshold,
+            hysteresis_threshold_on=args.hysteresis_threshold_on,
+            hysteresis_threshold_off=args.hysteresis_threshold_off,
+            do_verify_score_type=args.do_verify_score_type,
+            score_penalty_coef=args.score_penalty_coef,
+            token_acceptance_estimator=args.token_acceptance_estimator,
+            ssd_confidence_margin_threshold=args.ssd_confidence_margin_threshold,
+            ssd_entropy_temperature=args.ssd_entropy_temperature,
         )
         if args.return_forward_stats:
             generated_tokens, stats = result
@@ -146,6 +156,45 @@ def main(args):
     if stats is not None:
         print(f"Total forward steps: {stats['total_forward_steps']}")
         print(f"Decoding steps: {len(stats['decoding_order'])}")
+
+        prompt_len = input_ids.shape[1]
+        gen_ids = generated_tokens[0].tolist()
+
+        # Print position ordering per step
+        for i, step_info in enumerate(stats["decoding_order"]):
+            edits = step_info.get("edit", [])
+            unmasks = step_info.get("unmask", [])
+            if edits:
+                edit_markers = [-e[0] - 0.5 for e in edits]
+                print(f"[order] step {i} Edit  : {edit_markers}")
+            if unmasks:
+                print(f"[order] step {i} Unmask: {unmasks}")
+
+        # Print decoded tokens per step
+        for i, step_info in enumerate(stats["decoding_order"]):
+            edits = step_info.get("edit", [])
+            unmasks = step_info.get("unmask", [])
+            if edits:
+                items = []
+                for abs_pos, old_tok, new_tok in edits:
+                    old_piece = tokenizer.decode([old_tok], skip_special_tokens=False,
+                                                 clean_up_tokenization_spaces=False)
+                    new_piece = tokenizer.decode([new_tok], skip_special_tokens=False,
+                                                 clean_up_tokenization_spaces=False)
+                    items.append(f"{{{abs_pos}: {old_piece!r} -> {new_piece!r}}}")
+                print(f"[decode] step {i} Edit  : {', '.join(items)}")
+            if unmasks:
+                items = []
+                for p in unmasks:
+                    pos = int(p) if p > 0 else int(-p)
+                    gen_pos = pos - prompt_len
+                    if 0 <= gen_pos < len(gen_ids):
+                        tok_id = gen_ids[gen_pos]
+                        piece = tokenizer.decode([tok_id], skip_special_tokens=False,
+                                                 clean_up_tokenization_spaces=False)
+                        items.append(f"{{{p}: {piece!r}}}")
+                if items:
+                    print(f"[decode] step {i} Unmask: {', '.join(items)}")
 
 
 if __name__ == "__main__":
@@ -176,8 +225,25 @@ if __name__ == "__main__":
 
     # SSD-specific arguments (used when --generate-fn=ssd_policy)
     parser.add_argument("--min-ssd-span-length", type=int, default=1, help="Minimum mask span length to trigger 2L verification.")
+    parser.add_argument("--legacy-ssd-span-strategy", type=str2bool, default=False, help="If set, mask_span_length policy also checks high-confidence count before skipping verification.")
     parser.add_argument("--ssd-ratio-tempering-factor", type=float, default=1.0, help="Exponent applied to SSD acceptance ratios.")
-    parser.add_argument("--return-forward-stats", action="store_true", help="Return and print forward statistics (SSD only).")
+    parser.add_argument("--return-forward-stats", type=str2bool, default=False, help="Return and print forward statistics (SSD only).")
+
+    # SSD verification policy
+    parser.add_argument("--do-verify-policy", type=str, default="mask_span_length",
+                        choices=["mask_span_length", "score_threshold", "score_hysteresis"],
+                        help="Policy for deciding whether to run the 2L verifier.")
+    parser.add_argument("--do-verify-score-threshold", type=float, default=0.0, help="Threshold for score_threshold policy.")
+    parser.add_argument("--hysteresis-threshold-on", type=float, default=0.0, help="Turn-on threshold for score_hysteresis policy.")
+    parser.add_argument("--hysteresis-threshold-off", type=float, default=-1.0, help="Turn-off threshold for score_hysteresis policy.")
+    parser.add_argument("--do-verify-score-type", type=str, default="difference_dynamic", choices=["difference_dynamic", "difference_static"],
+                        help="Score function for score-based verify policies.")
+    parser.add_argument("--score-penalty-coef", type=float, default=2.0, help="Penalty coefficient c in score computation.")
+    parser.add_argument("--token-acceptance-estimator", type=str, default="hard_margin_threshold",
+                        choices=["hard_margin_threshold", "soft_entropy_negexp", "soft_renyi_2_entropy"],
+                        help="Estimator for per-token acceptance probability.")
+    parser.add_argument("--ssd-confidence-margin-threshold", type=float, default=0.05, help="Margin threshold for hard_margin_threshold estimator.")
+    parser.add_argument("--ssd-entropy-temperature", type=float, default=1.0, help="Temperature for soft_entropy_negexp estimator.")
 
     args = parser.parse_args()
     main(args)
