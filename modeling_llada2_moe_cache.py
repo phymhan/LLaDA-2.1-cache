@@ -881,16 +881,29 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
 
         # Attention mask handling
         if attention_mask is not None:
-            if attention_mask.size() == (batch_size, 1, seq_length, seq_length):
-                attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                    attention_mask,
-                    (batch_size, seq_length),
-                    inputs_embeds,
-                    past_seen_tokens,
-                )
+            if attention_mask.dim() == 4 and attention_mask.shape[:3] == (batch_size, 1, seq_length):
+                kv_length = attention_mask.size(3)
+                if kv_length == seq_length:
+                    # Square mask (standard block-causal): prepare for SDPA
+                    attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                        attention_mask,
+                        (batch_size, seq_length),
+                        inputs_embeds,
+                        past_seen_tokens,
+                    )
+                else:
+                    # Non-square mask (e.g. 2L verifier for SSD): pass through as-is,
+                    # already in SDPA-compatible (batch, 1, q_len, kv_len) float format.
+                    pass
+            elif attention_mask.dim() == 3 and attention_mask.shape[0] == batch_size:
+                # 3D bool mask (batch, q_len, kv_len): convert to 4D SDPA float format
+                attention_mask = attention_mask.unsqueeze(1)  # (batch, 1, q_len, kv_len)
+                attention_mask = attention_mask.to(dtype=inputs_embeds.dtype)
+                attention_mask = (1.0 - attention_mask) * torch.finfo(inputs_embeds.dtype).min
             else:
                 raise ValueError(
-                    f"LLaDA2.0 only support block attention mask with shape: {(batch_size, 1, seq_length, seq_length)}, the input attention with shape {attention_mask.size()=}!"
+                    f"LLaDA2.0 only support attention mask with shape (batch, 1, q_len, kv_len) or "
+                    f"(batch, q_len, kv_len), got {attention_mask.size()=}!"
                 )
         # If attention_mask is None, full attention is used (for cached decode phase)
 
