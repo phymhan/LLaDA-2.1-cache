@@ -88,7 +88,7 @@ def main(args):
     # Common kwargs shared by all generate functions
     generate_fn_kwargs = dict(
         model=model,
-        inputs=input_ids,
+        input_ids=input_ids,
         temperature=args.temperature,
         block_length=args.block_length,
         # steps=args.steps,

@@ -46,15 +46,15 @@ def load_model_and_tokenizer(model_path, dtype_str="bfloat16", device_map="auto"
 @torch.no_grad()
 def generate_cached(
     model,
-    inputs,
+    input_ids,
+    attention_mask=None,
     temperature=0.0,
     block_length=32,
-    # steps=32,
     gen_length=2048,
+    max_gen_toks=None,
     top_p=None,
     top_k=None,
     eos_early_stop=False,
-    # minimal_topk=1,
     threshold=0.95,
     editing_threshold=0.9,
     max_post_steps=16,
@@ -62,6 +62,7 @@ def generate_cached(
     mask_id=156895,
     num_to_transfer=1,
     record_decoding_order=False,
+    return_stats=True,
     **kwargs,
 ):
     """
@@ -73,10 +74,12 @@ def generate_cached(
 
     Args:
         model: LLaDA2MoeModelLM instance
-        inputs: Input token IDs (tensor)
+        input_ids: Input token IDs (tensor)
+        attention_mask: Attention mask (currently unused, reserved for future)
         temperature: Sampling temperature (0.0 for greedy)
         block_length: Tokens per generation block
         gen_length: Total number of tokens to generate
+        max_gen_toks: If not None, overrides gen_length
         top_p: Nucleus sampling threshold (None to disable)
         top_k: Top-k sampling cutoff (None to disable)
         eos_early_stop: Stop generation at first EOS token
@@ -87,14 +90,17 @@ def generate_cached(
         mask_id: Mask token ID for refinement
         num_to_transfer: Minimum masked positions to resolve per iteration
         record_decoding_order: If True, also record per-step decoding_order
+        return_stats: If True, return (tensor, stats_dict); if False, return tensor only
 
     Returns:
-        tuple: (tensor, stats_dict) where tensor is generated token IDs and
-        stats_dict always contains "nfe" (number of forward evaluations).
-        When record_decoding_order is True, stats_dict also contains "decoding_order".
+        If return_stats is True (default): (tensor, stats_dict) where tensor is
+        generated token IDs and stats_dict contains "nfe". When record_decoding_order
+        is True, stats_dict also contains "decoding_order".
+        If return_stats is False: tensor of generated token IDs only.
     """
-    # steps = min(steps, gen_length // minimal_topk)
-    input_ids = inputs.to(model.device)
+    if max_gen_toks is not None:
+        gen_length = max_gen_toks
+    input_ids = input_ids.to(model.device)
 
     prompt_length = input_ids.shape[1]
     num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
@@ -272,6 +278,8 @@ def generate_cached(
         :, input_ids.shape[1] : input_ids.shape[1] + first_eos_position + 1
     ]
 
+    if not return_stats:
+        return result
     stats = {"nfe": nfe}
     if record_decoding_order:
         stats["decoding_order"] = decoding_order
@@ -281,10 +289,12 @@ def generate_cached(
 @torch.no_grad()
 def generate(
     model,
-    inputs,
+    input_ids,
+    attention_mask=None,
     temperature=0.0,
     block_length=32,
     gen_length=2048,
+    max_gen_toks=None,
     top_p=None,
     top_k=None,
     eos_early_stop=False,
@@ -295,6 +305,7 @@ def generate(
     mask_id=156895,
     num_to_transfer=1,
     record_decoding_order=False,
+    return_stats=True,
     **kwargs,
 ):
     """
@@ -305,10 +316,12 @@ def generate(
 
     Args:
         model: LLaDA2MoeModelLM instance (or any compatible model)
-        inputs: Input token IDs (tensor)
+        input_ids: Input token IDs (tensor)
+        attention_mask: Attention mask (currently unused, reserved for future)
         temperature: Sampling temperature (0.0 for greedy)
         block_length: Tokens per generation block
         gen_length: Total number of tokens to generate
+        max_gen_toks: If not None, overrides gen_length
         top_p: Nucleus sampling threshold (None to disable)
         top_k: Top-k sampling cutoff (None to disable)
         eos_early_stop: Stop generation at first EOS token
@@ -319,13 +332,17 @@ def generate(
         mask_id: Mask token ID for refinement
         num_to_transfer: Minimum masked positions to resolve per iteration
         record_decoding_order: If True, also record per-step decoding_order
+        return_stats: If True, return (tensor, stats_dict); if False, return tensor only
 
     Returns:
-        tuple: (tensor, stats_dict) where tensor is generated token IDs and
-        stats_dict always contains "nfe" (number of forward evaluations).
-        When record_decoding_order is True, stats_dict also contains "decoding_order".
+        If return_stats is True (default): (tensor, stats_dict) where tensor is
+        generated token IDs and stats_dict contains "nfe". When record_decoding_order
+        is True, stats_dict also contains "decoding_order".
+        If return_stats is False: tensor of generated token IDs only.
     """
-    input_ids = inputs.to(model.device)
+    if max_gen_toks is not None:
+        gen_length = max_gen_toks
+    input_ids = input_ids.to(model.device)
 
     prompt_length = input_ids.shape[1]
     num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
@@ -464,6 +481,8 @@ def generate(
         :, input_ids.shape[1] : input_ids.shape[1] + first_eos_position + 1
     ]
 
+    if not return_stats:
+        return result
     stats = {"nfe": nfe}
     if record_decoding_order:
         stats["decoding_order"] = decoding_order
@@ -671,11 +690,12 @@ def _compute_do_verify_score(
 @torch.no_grad()
 def generate_ssd_policy(
     model,
-    inputs,
+    input_ids,
+    attention_mask=None,
     temperature=0.0,
     block_length=32,
-    # steps=32,
     gen_length=2048,
+    max_gen_toks=None,
     top_p=None,
     top_k=None,
     eos_early_stop=False,
@@ -687,6 +707,7 @@ def generate_ssd_policy(
     legacy_ssd_span_strategy=False,
     ssd_ratio_tempering_factor=1.0,
     record_decoding_order=False,
+    return_stats=True,
     # Policy selection
     do_verify_policy="mask_span_length",
     # Score-based policy parameters
@@ -725,11 +746,12 @@ def generate_ssd_policy(
 
     Args:
         model: LLaDA2MoeModelLM instance
-        inputs: Input token IDs (tensor)
+        input_ids: Input token IDs (tensor)
+        attention_mask: Attention mask (currently unused, reserved for future)
         temperature: Sampling temperature (0.0 for greedy)
         block_length: Tokens per generation block
-        steps: Denoising steps per block
         gen_length: Total number of tokens to generate
+        max_gen_toks: If not None, overrides gen_length
         top_p: Nucleus sampling threshold (None to disable)
         top_k: Top-k sampling cutoff (None to disable)
         eos_early_stop: Stop generation at first EOS token
@@ -742,6 +764,7 @@ def generate_ssd_policy(
             enough high-confidence tokens before skipping verification
         ssd_ratio_tempering_factor: Exponent applied to acceptance ratios
         record_decoding_order: If True, also record per-step decoding_order
+        return_stats: If True, return (tensor, stats_dict); if False, return tensor only
         do_verify_policy: Policy for deciding whether to run the 2L verifier
         do_verify_score_threshold: Threshold for score_threshold policy
         hysteresis_threshold_on: Turn-on threshold for score_hysteresis policy
@@ -753,11 +776,14 @@ def generate_ssd_policy(
         ssd_entropy_temperature: Temperature for soft_entropy_negexp
 
     Returns:
-        tuple: (tensor, stats_dict) where tensor is generated token IDs and
-        stats_dict always contains "nfe" (number of forward evaluations).
-        When record_decoding_order is True, stats_dict also contains "decoding_order".
+        If return_stats is True (default): (tensor, stats_dict) where tensor is
+        generated token IDs and stats_dict contains "nfe". When record_decoding_order
+        is True, stats_dict also contains "decoding_order".
+        If return_stats is False: tensor of generated token IDs only.
     """
-    input_ids = inputs.to(model.device)
+    if max_gen_toks is not None:
+        gen_length = max_gen_toks
+    input_ids = input_ids.to(model.device)
     prompt_length = input_ids.shape[1]
     num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
     total_length = num_blocks * block_length
@@ -1073,6 +1099,8 @@ def generate_ssd_policy(
 
     result = generated_answer[:, input_ids.shape[1]:input_ids.shape[1] + first_eos_position + 1]
 
+    if not return_stats:
+        return result
     stats = {"nfe": nfe}
     if record_decoding_order:
         stats["decoding_order"] = decoding_order

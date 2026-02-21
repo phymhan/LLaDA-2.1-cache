@@ -350,7 +350,7 @@ def main():
                 set_seed(args.seed + 1000 + vote_i)
 
             generated_tokens, stats = gen_fn(
-                model=model, inputs=input_ids, **gen_fn_kwargs
+                model=model, input_ids=input_ids, **gen_fn_kwargs
             )
             total_nfe += stats["nfe"]
 
