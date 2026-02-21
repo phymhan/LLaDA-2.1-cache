@@ -27,7 +27,7 @@ import torch
 from datasets import load_dataset
 from tqdm import tqdm
 
-from generate_utils import generate_cached, generate_ssd_policy, load_model_and_tokenizer
+from generate_utils import generate, generate_cached, generate_ssd_policy, load_model_and_tokenizer
 from utils import set_seed, str2bool
 
 # ---------------------------------------------------------------------------
@@ -166,27 +166,21 @@ def main():
     gen_group = parser.add_argument_group("Generation Settings")
     gen_group.add_argument("--gen_length", type=int, default=256, help="Maximum generation length in tokens")
     gen_group.add_argument("--block_length", type=int, default=32, help="Block length for diffusion decoding")
-    gen_group.add_argument("--steps", type=int, default=32, help="Refinement steps per block")
     gen_group.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 for greedy)")
     gen_group.add_argument("--top_k", type=int, default=None, help="Top-k sampling cutoff")
     gen_group.add_argument("--top_p", type=float, default=None, help="Nucleus sampling threshold")
-    gen_group.add_argument("--threshold", type=float, default=0.5, help="Acceptance threshold for unmasking tokens")
-    gen_group.add_argument("--editing_threshold", type=float, default=0.0, help="Editing threshold for generation")
+    gen_group.add_argument("--threshold", type=float, default=0.7, help="Acceptance threshold for unmasking tokens")
+    gen_group.add_argument("--editing_threshold", type=float, default=0.5, help="Editing threshold for generation")
+    gen_group.add_argument("--max_post_steps", type=int, default=0, help="Post-mask global editing steps per block")
+    gen_group.add_argument("--num_to_transfer", type=int, default=1, help="Minimum masked positions to resolve per iteration")
     gen_group.add_argument("--eos_early_stop", type=str2bool, default=True, help="Enable/disable early stopping at EOS")
-    gen_group.add_argument("--generate_fn", type=str, default="cached", choices=["cached", "ssd_policy"], help="Generation function to use")
-
-    # ── generate_cached-specific ──
-    cached_group = parser.add_argument_group("generate_cached-specific")
-    cached_group.add_argument("--minimal_topk", type=int, default=1, help="Caps effective steps via gen_length // minimal_topk")
-    cached_group.add_argument("--max_post_steps", type=int, default=16, help="Post-mask global editing steps per block")
-    cached_group.add_argument("--num_to_transfer", type=int, default=1, help="Minimum masked positions to resolve per iteration")
+    gen_group.add_argument("--generate_fn", type=str, default="cached", choices=["nocache", "cached", "ssd_policy"], help="Generation function to use")
 
     # ── SSD-specific ──
     ssd_group = parser.add_argument_group("SSD-specific (ssd_policy)")
     ssd_group.add_argument("--min_ssd_span_length", type=int, default=1, help="Minimum mask span length to trigger 2L verification")
     ssd_group.add_argument("--legacy_ssd_span_strategy", type=str2bool, default=False, help="If set, mask_span_length policy also checks high-confidence count")
     ssd_group.add_argument("--ssd_ratio_tempering_factor", type=float, default=1.0, help="Exponent applied to SSD acceptance ratios")
-    ssd_group.add_argument("--return_forward_stats", type=str2bool, default=False, help="Return forward statistics (SSD only)")
     ssd_group.add_argument("--do_verify_policy", type=str, default="mask_span_length", choices=["mask_span_length", "score_threshold", "score_hysteresis"], help="Policy for deciding whether to run the 2L verifier")
     ssd_group.add_argument("--do_verify_score_threshold", type=float, default=0.0, help="Threshold for score_threshold policy")
     ssd_group.add_argument("--hysteresis_threshold_on", type=float, default=0.0, help="Turn-on threshold for score_hysteresis policy")
@@ -236,12 +230,13 @@ def main():
     print(f"  EOS id: {args.eos_id}")
     print(f"  Gen length: {args.gen_length}")
     print(f"  Block length: {args.block_length}")
-    print(f"  Steps: {args.steps}")
     print(f"  Temperature: {args.temperature}")
     print(f"  Top-k: {args.top_k}")
     print(f"  Top-p: {args.top_p}")
     print(f"  Threshold: {args.threshold}")
     print(f"  Editing threshold: {args.editing_threshold}")
+    print(f"  Max post steps: {args.max_post_steps}")
+    print(f"  Num to transfer: {args.num_to_transfer}")
     print(f"  Few-shot: {args.few_shot}")
     print(f"  CoT: {args.cot}")
     print(f"  Majority vote: {args.use_majority_vote} (n={args.n_votes})")
@@ -271,8 +266,48 @@ def main():
     datasize = len(dataset)
     print("gsm8k test size:", datasize)
 
+    # ── Set up generate function and static kwargs (like references/eval_gsm8k_sdar.py) ──
+    gen_fn_kwargs = dict(
+        temperature=args.temperature,
+        block_length=args.block_length,
+        gen_length=args.gen_length,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        eos_early_stop=args.eos_early_stop,
+        eos_id=args.eos_id,
+        mask_id=args.mask_id,
+        threshold=args.threshold,
+        editing_threshold=args.editing_threshold,
+        max_post_steps=args.max_post_steps,
+        num_to_transfer=args.num_to_transfer,
+    )
+
+    if args.generate_fn == "nocache":
+        gen_fn = generate
+    elif args.generate_fn == "cached":
+        gen_fn = generate_cached
+    elif args.generate_fn == "ssd_policy":
+        gen_fn = generate_ssd_policy
+        gen_fn_kwargs.update(
+            min_ssd_span_length=args.min_ssd_span_length,
+            legacy_ssd_span_strategy=args.legacy_ssd_span_strategy,
+            ssd_ratio_tempering_factor=args.ssd_ratio_tempering_factor,
+            do_verify_policy=args.do_verify_policy,
+            do_verify_score_threshold=args.do_verify_score_threshold,
+            hysteresis_threshold_on=args.hysteresis_threshold_on,
+            hysteresis_threshold_off=args.hysteresis_threshold_off,
+            do_verify_score_type=args.do_verify_score_type,
+            score_penalty_coef=args.score_penalty_coef,
+            token_acceptance_estimator=args.token_acceptance_estimator,
+            ssd_confidence_margin_threshold=args.ssd_confidence_margin_threshold,
+            ssd_entropy_temperature=args.ssd_entropy_temperature,
+        )
+    else:
+        raise ValueError(f"Unknown generate function: {args.generate_fn}")
+
     results = []
     correct_so_far = 0
+    total_nfe = 0
     acc_series = []
 
     eval_t0 = time.perf_counter()
@@ -314,55 +349,11 @@ def main():
             if n_votes > 1:
                 set_seed(args.seed + 1000 + vote_i)
 
-            # Common kwargs shared by both generate functions
-            generate_fn_kwargs = dict(
-                model=model,
-                inputs=input_ids,
-                temperature=args.temperature,
-                block_length=args.block_length,
-                steps=args.steps,
-                gen_length=args.gen_length,
-                top_p=args.top_p,
-                top_k=args.top_k,
-                eos_early_stop=args.eos_early_stop,
-                eos_id=args.eos_id,
-                mask_id=args.mask_id,
-                threshold=args.threshold,
-                editing_threshold=args.editing_threshold,
+            generated_tokens, stats = gen_fn(
+                model=model, inputs=input_ids, **gen_fn_kwargs
             )
+            total_nfe += stats["nfe"]
 
-            if args.generate_fn == "cached":
-                generate_fn_kwargs.update(
-                    minimal_topk=args.minimal_topk,
-                    max_post_steps=args.max_post_steps,
-                    num_to_transfer=args.num_to_transfer,
-                )
-                generated_tokens = generate_cached(**generate_fn_kwargs)
-            elif args.generate_fn == "ssd_policy":
-                generate_fn_kwargs.update(
-                    min_ssd_span_length=args.min_ssd_span_length,
-                    legacy_ssd_span_strategy=args.legacy_ssd_span_strategy,
-                    ssd_ratio_tempering_factor=args.ssd_ratio_tempering_factor,
-                    return_forward_stats=args.return_forward_stats,
-                    do_verify_policy=args.do_verify_policy,
-                    do_verify_score_threshold=args.do_verify_score_threshold,
-                    hysteresis_threshold_on=args.hysteresis_threshold_on,
-                    hysteresis_threshold_off=args.hysteresis_threshold_off,
-                    do_verify_score_type=args.do_verify_score_type,
-                    score_penalty_coef=args.score_penalty_coef,
-                    token_acceptance_estimator=args.token_acceptance_estimator,
-                    ssd_confidence_margin_threshold=args.ssd_confidence_margin_threshold,
-                    ssd_entropy_temperature=args.ssd_entropy_temperature,
-                )
-                result = generate_ssd_policy(**generate_fn_kwargs)
-                if args.return_forward_stats:
-                    generated_tokens, _stats = result
-                else:
-                    generated_tokens = result
-            else:
-                raise ValueError(f"Unknown generate function: {args.generate_fn}")
-
-            # generate_cached / generate_ssd_policy already strip the prompt
             out_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
             pred_num = extract_predicted_answer(out_text)
             batch_model_answers.append({"text": out_text, "numeric": pred_num})
@@ -405,9 +396,11 @@ def main():
     cnt = sum(1 for r in results if r["correct"])
     total = len(results)
     acc = cnt / total if total > 0 else 0.0
+    avg_nfe = total_nfe / total if total > 0 else 0.0
     print(f"Accuracy: {cnt} / {total} = {acc:.4f}")
+    print(f"Total NFE: {total_nfe}, Avg NFE: {avg_nfe:.1f}")
 
-    results.append({"accuracy": acc})
+    results.append({"accuracy": acc, "total_nfe": total_nfe, "avg_nfe": avg_nfe})
 
     # ── Summary logging ──
     if args.summary_file:
@@ -427,13 +420,16 @@ def main():
             "acc": acc,
             "correct": cnt,
             "total": total,
+            "total_nfe": total_nfe,
+            "avg_nfe": avg_nfe,
             "eval_seconds": eval_seconds,
             "gen_length": args.gen_length,
             "block_length": args.block_length,
-            "steps": args.steps,
             "temperature": args.temperature,
             "threshold": args.threshold,
             "editing_threshold": args.editing_threshold,
+            "max_post_steps": args.max_post_steps,
+            "num_to_transfer": args.num_to_transfer,
             "generate_fn": args.generate_fn,
             "model": args.model,
             "sample_n": args.sample_n,
@@ -463,13 +459,15 @@ def main():
         txt_line = (
             f"config={summary_rec['config']} "
             f"acc={acc:.4f} ({cnt}/{total}) "
+            f"total_nfe={total_nfe} avg_nfe={avg_nfe:.1f} "
             f"eval_seconds={eval_seconds:.3f} "
             f"gen_length={args.gen_length} "
             f"block_length={args.block_length} "
-            f"steps={args.steps} "
             f"temperature={args.temperature} "
             f"threshold={args.threshold} "
             f"editing_threshold={args.editing_threshold} "
+            f"max_post_steps={args.max_post_steps} "
+            f"num_to_transfer={args.num_to_transfer} "
             f"generate_fn={args.generate_fn} "
             f"model={args.model} "
             f"sample_n={args.sample_n} "

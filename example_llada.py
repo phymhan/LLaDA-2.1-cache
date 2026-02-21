@@ -14,7 +14,7 @@ from typing import Optional
 
 import torch
 
-from generate_utils import generate_cached, generate_ssd_policy, load_model_and_tokenizer
+from generate_utils import generate, generate_cached, generate_ssd_policy, load_model_and_tokenizer
 from utils import set_seed, str2bool
 
 
@@ -85,13 +85,13 @@ def main(args):
     t0 = time.perf_counter()
     stats = None
 
-    # Common kwargs shared by both generate functions
+    # Common kwargs shared by all generate functions
     generate_fn_kwargs = dict(
         model=model,
         inputs=input_ids,
         temperature=args.temperature,
         block_length=args.block_length,
-        steps=args.steps,
+        # steps=args.steps,
         gen_length=args.gen_length,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -100,21 +100,21 @@ def main(args):
         mask_id=args.mask_id,
         threshold=args.threshold,
         editing_threshold=args.editing_threshold,
+        num_to_transfer=args.num_to_transfer,
+        max_post_steps=args.max_post_steps,
+        record_decoding_order=args.record_decoding_order,
+        # minimal_topk=args.minimal_topk,
     )
 
-    if args.generate_fn == "cached":
-        generate_fn_kwargs.update(
-            minimal_topk=args.minimal_topk,
-            max_post_steps=args.max_post_steps,
-            num_to_transfer=args.num_to_transfer,
-        )
-        generated_tokens = generate_cached(**generate_fn_kwargs)
+    if args.generate_fn == "nocache":
+        generated_tokens, stats = generate(**generate_fn_kwargs)
+    elif args.generate_fn == "cached":
+        generated_tokens, stats = generate_cached(**generate_fn_kwargs)
     elif args.generate_fn == "ssd_policy":
         generate_fn_kwargs.update(
             min_ssd_span_length=args.min_ssd_span_length,
             legacy_ssd_span_strategy=args.legacy_ssd_span_strategy,
             ssd_ratio_tempering_factor=args.ssd_ratio_tempering_factor,
-            return_forward_stats=args.return_forward_stats,
             do_verify_policy=args.do_verify_policy,
             do_verify_score_threshold=args.do_verify_score_threshold,
             hysteresis_threshold_on=args.hysteresis_threshold_on,
@@ -125,11 +125,7 @@ def main(args):
             ssd_confidence_margin_threshold=args.ssd_confidence_margin_threshold,
             ssd_entropy_temperature=args.ssd_entropy_temperature,
         )
-        result = generate_ssd_policy(**generate_fn_kwargs)
-        if args.return_forward_stats:
-            generated_tokens, stats = result
-        else:
-            generated_tokens = result
+        generated_tokens, stats = generate_ssd_policy(**generate_fn_kwargs)
     else:
         raise ValueError(f"Unknown generate function: {args.generate_fn}")
 
@@ -145,9 +141,9 @@ def main(args):
     print(f"Tokens generated: {num_generated}")
     print(f"Time: {t1 - t0:.2f}s")
     print(f"Speed: {num_generated / (t1 - t0):.1f} tok/s")
+    print(f"NFE: {stats['nfe']}")
 
-    if stats is not None:
-        print(f"Total forward steps: {stats['total_forward_steps']}")
+    if "decoding_order" in stats:
         print(f"Decoding steps: {len(stats['decoding_order'])}")
 
         prompt_len = input_ids.shape[1]
@@ -158,8 +154,8 @@ def main(args):
             edits = step_info.get("edit", [])
             unmasks = step_info.get("unmask", [])
             if edits:
-                edit_markers = [-e[0] - 0.5 for e in edits]
-                print(f"[order] step {i} Edit  : {edit_markers}")
+                edit_positions = [e[0] + 0.5 for e in edits]
+                print(f"[order] step {i} <Edit>: {edit_positions}")
             if unmasks:
                 print(f"[order] step {i} Unmask: {unmasks}")
 
@@ -175,12 +171,12 @@ def main(args):
                     new_piece = tokenizer.decode([new_tok], skip_special_tokens=False,
                                                  clean_up_tokenization_spaces=False)
                     items.append(f"{{{abs_pos}: {old_piece!r} -> {new_piece!r}}}")
-                print(f"[decode] step {i} Edit  : {', '.join(items)}")
+                print(f"[decode] step {i} <Edit>: {', '.join(items)}")
             if unmasks:
                 items = []
                 for p in unmasks:
-                    pos = int(p) if p > 0 else int(-p)
-                    gen_pos = pos - prompt_len
+                    abs_pos = int(abs(p))
+                    gen_pos = abs_pos - prompt_len
                     if 0 <= gen_pos < len(gen_ids):
                         tok_id = gen_ids[gen_pos]
                         piece = tokenizer.decode([tok_id], skip_special_tokens=False,
@@ -199,13 +195,13 @@ if __name__ == "__main__":
     parser.add_argument("--device_map", type=str, default="auto", help="Transformers device_map value.")
     parser.add_argument("--gen_length", type=int, default=512, help="Number of tokens to generate.")
     parser.add_argument("--block_length", type=int, default=32, help="Block length used by model.generate.")
-    parser.add_argument("--steps", type=int, default=32, help="Refinement steps per block.")
+    # parser.add_argument("--steps", type=int, default=32, help="Refinement steps per block.")
     parser.add_argument("--top_p", type=float, default=None, help="Optional nucleus sampling threshold.")
     parser.add_argument("--top_k", type=int, default=None, help="Optional top-k sampling cutoff.")
-    parser.add_argument("--minimal_topk", type=int, default=1, help="Caps effective steps via gen_length // minimal_topk.")
-    parser.add_argument("--threshold", type=float, default=0.5, help="Acceptance threshold for generation.")
-    parser.add_argument("--editing_threshold", type=float, default=0.0, help="Editing threshold for generation.")
-    parser.add_argument("--max_post_steps", type=int, default=16, help="Post-mask global editing steps per block.")
+    # parser.add_argument("--minimal_topk", type=int, default=1, help="Caps effective steps via gen_length // minimal_topk.")
+    parser.add_argument("--threshold", type=float, default=0.7, help="Acceptance threshold for generation.")
+    parser.add_argument("--editing_threshold", type=float, default=0.5, help="Editing threshold for generation.")
+    parser.add_argument("--max_post_steps", type=int, default=0, help="Post-mask global editing steps per block.")
     parser.add_argument("--eos_id", type=int, default=156892, help="EOS token id for early stopping.")
     parser.add_argument("--mask_id", type=int, default=156895, help="Mask token id used during iterative refinement.")
     parser.add_argument("--num_to_transfer", type=int, default=1, help="Minimum number of masked positions to resolve per iteration.")
@@ -214,13 +210,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
 
     # Generation function selection
-    parser.add_argument("--generate_fn", type=str, choices=["cached", "ssd_policy"], default="cached", help="Generation function to use.")
+    parser.add_argument("--generate_fn", type=str, choices=["nocache", "cached", "ssd_policy"], default="cached", help="Generation function to use.")
+    parser.add_argument("--record_decoding_order", type=str2bool, default=False, help="Record and print per-step decoding order.")
 
     # SSD-specific arguments (used when --generate_fn=ssd_policy)
     parser.add_argument("--min_ssd_span_length", type=int, default=1, help="Minimum mask span length to trigger 2L verification.")
     parser.add_argument("--legacy_ssd_span_strategy", type=str2bool, default=False, help="If set, mask_span_length policy also checks high-confidence count before skipping verification.")
     parser.add_argument("--ssd_ratio_tempering_factor", type=float, default=1.0, help="Exponent applied to SSD acceptance ratios.")
-    parser.add_argument("--return_forward_stats", type=str2bool, default=False, help="Return and print forward statistics (SSD only).")
 
     # SSD verification policy
     parser.add_argument("--do_verify_policy", type=str, default="mask_span_length",

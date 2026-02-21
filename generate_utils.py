@@ -49,18 +49,20 @@ def generate_cached(
     inputs,
     temperature=0.0,
     block_length=32,
-    steps=32,
+    # steps=32,
     gen_length=2048,
     top_p=None,
     top_k=None,
     eos_early_stop=False,
-    minimal_topk=1,
+    # minimal_topk=1,
     threshold=0.95,
     editing_threshold=0.9,
     max_post_steps=16,
     eos_id=156892,
     mask_id=156895,
     num_to_transfer=1,
+    record_decoding_order=False,
+    **kwargs,
 ):
     """
     Generate text using iterative masked refinement with KV cache.
@@ -74,23 +76,24 @@ def generate_cached(
         inputs: Input token IDs (tensor)
         temperature: Sampling temperature (0.0 for greedy)
         block_length: Tokens per generation block
-        steps: Maximum refinement iterations per block
         gen_length: Total number of tokens to generate
         top_p: Nucleus sampling threshold (None to disable)
         top_k: Top-k sampling cutoff (None to disable)
         eos_early_stop: Stop generation at first EOS token
-        minimal_topk: Caps effective steps via gen_length // minimal_topk
         threshold: Confidence threshold for unmasking tokens
         editing_threshold: Confidence threshold for editing non-masked tokens
         max_post_steps: Maximum global editing steps after all masks resolved
         eos_id: EOS token ID
         mask_id: Mask token ID for refinement
         num_to_transfer: Minimum masked positions to resolve per iteration
+        record_decoding_order: If True, also record per-step decoding_order
 
     Returns:
-        tensor: Generated token IDs (prompt + generated tokens up to first EOS)
+        tuple: (tensor, stats_dict) where tensor is generated token IDs and
+        stats_dict always contains "nfe" (number of forward evaluations).
+        When record_decoding_order is True, stats_dict also contains "decoding_order".
     """
-    steps = min(steps, gen_length // minimal_topk)
+    # steps = min(steps, gen_length // minimal_topk)
     input_ids = inputs.to(model.device)
 
     prompt_length = input_ids.shape[1]
@@ -114,6 +117,8 @@ def generate_cached(
     prefill_length = prefill_blocks * block_length
 
     past_key_values = DynamicCache()
+    nfe = 0
+    decoding_order = [] if record_decoding_order else None
 
     # ── Prefill stage: process all complete prompt blocks and store KV ──
     if prefill_length > 0:
@@ -130,6 +135,7 @@ def generate_cached(
             use_cache=True,
             store_kv=True,
         )
+        nfe += 1
 
     # ── Decode stage: process each block with KV cache ──
     for num_block in range(prefill_blocks, num_blocks):
@@ -156,6 +162,8 @@ def generate_cached(
             if post_steps > max_post_steps:
                 break
 
+            step_info = {"edit": [], "unmask": []} if record_decoding_order else None
+
             # Forward with cache (don't store KV during denoising iterations)
             # attention_mask=None means full attention to all cached + current tokens
             outputs = model(
@@ -167,6 +175,7 @@ def generate_cached(
                 store_kv=False,
             )
             logits = outputs.logits  # (1, block_length, vocab_size)
+            nfe += 1
 
             x0, x0_p = model._sample_with_temperature_topk_topp(
                 logits, temperature=temperature, top_k=top_k, top_p=top_p
@@ -209,6 +218,20 @@ def generate_cached(
             if final_transfer_index.any():
                 cur_x[final_transfer_index] = x0[final_transfer_index]
 
+            if record_decoding_order:
+                base_abs = block_start_pos
+                # Record mask-filling positions
+                for pos in mask_transfer_index[0].nonzero(as_tuple=True)[0].tolist():
+                    abs_pos = base_abs + pos
+                    step_info["unmask"].append(int(abs_pos))
+                # Record editing positions
+                for pos in editing_transfer_index[0].nonzero(as_tuple=True)[0].tolist():
+                    abs_pos = base_abs + pos
+                    old_tok = int(old_block_tokens[0, pos].item())
+                    new_tok = int(x0[0, pos].item())
+                    step_info["edit"].append((abs_pos, old_tok, new_tok))
+                decoding_order.append(step_info)
+
             if active_block_mask.sum() == 0 and not editing_transfer_index.any():
                 break
 
@@ -233,6 +256,7 @@ def generate_cached(
                 use_cache=True,
                 store_kv=True,
             )
+            nfe += 1
 
     # ── Extract generated tokens ──
     generated_answer = x[:, : prompt_length + gen_length]
@@ -244,9 +268,206 @@ def generate_cached(
     else:
         first_eos_position = gen_length
 
-    return generated_answer[
+    result = generated_answer[
         :, input_ids.shape[1] : input_ids.shape[1] + first_eos_position + 1
     ]
+
+    stats = {"nfe": nfe}
+    if record_decoding_order:
+        stats["decoding_order"] = decoding_order
+    return result, stats
+
+
+@torch.no_grad()
+def generate(
+    model,
+    inputs,
+    temperature=0.0,
+    block_length=32,
+    gen_length=2048,
+    top_p=None,
+    top_k=None,
+    eos_early_stop=False,
+    threshold=0.95,
+    editing_threshold=0.9,
+    max_post_steps=16,
+    eos_id=156892,
+    mask_id=156895,
+    num_to_transfer=1,
+    record_decoding_order=False,
+    **kwargs,
+):
+    """
+    Generate text using iterative masked refinement without KV cache.
+
+    Each iteration passes the full sequence x[:, :current_window_end] with
+    block-causal attention. Logits are sliced to the last block_length positions.
+
+    Args:
+        model: LLaDA2MoeModelLM instance (or any compatible model)
+        inputs: Input token IDs (tensor)
+        temperature: Sampling temperature (0.0 for greedy)
+        block_length: Tokens per generation block
+        gen_length: Total number of tokens to generate
+        top_p: Nucleus sampling threshold (None to disable)
+        top_k: Top-k sampling cutoff (None to disable)
+        eos_early_stop: Stop generation at first EOS token
+        threshold: Confidence threshold for unmasking tokens
+        editing_threshold: Confidence threshold for editing non-masked tokens
+        max_post_steps: Maximum global editing steps after all masks resolved
+        eos_id: EOS token ID
+        mask_id: Mask token ID for refinement
+        num_to_transfer: Minimum masked positions to resolve per iteration
+        record_decoding_order: If True, also record per-step decoding_order
+
+    Returns:
+        tuple: (tensor, stats_dict) where tensor is generated token IDs and
+        stats_dict always contains "nfe" (number of forward evaluations).
+        When record_decoding_order is True, stats_dict also contains "decoding_order".
+    """
+    input_ids = inputs.to(model.device)
+
+    prompt_length = input_ids.shape[1]
+    num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+    total_length = num_blocks * block_length
+
+    block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=model.device))
+    block_diffusion_attention_mask = (
+        block_mask.repeat_interleave(block_length, dim=0)
+        .repeat_interleave(block_length, dim=1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    ).to(model.dtype)
+
+    position_ids = torch.arange(total_length, device=model.device).unsqueeze(0)
+    x = torch.full((1, total_length), mask_id, dtype=torch.long, device=model.device)
+    x[:, :prompt_length] = input_ids.clone()
+
+    prefill_blocks = prompt_length // block_length
+    nfe = 0
+    decoding_order = [] if record_decoding_order else None
+
+    for num_block in range(prefill_blocks, num_blocks):
+        current_window_end = (num_block + 1) * block_length
+        cur_x = x[:, :current_window_end]
+        cur_attn_mask = block_diffusion_attention_mask[
+            :, :, :current_window_end, :current_window_end
+        ]
+        cur_position_ids = position_ids[:, :current_window_end]
+        block_start_pos = num_block * block_length
+
+        # Prompt tokens within this block (if any)
+        prompt_mask_in_block = torch.zeros(
+            block_length, dtype=torch.bool, device=model.device
+        )
+        if block_start_pos < prompt_length:
+            prompt_end_in_block = min(prompt_length - block_start_pos, block_length)
+            prompt_mask_in_block[:prompt_end_in_block] = True
+
+        post_steps = 0
+        while True:
+            old_block_tokens = cur_x[:, -block_length:].clone()
+            active_block_mask = cur_x[:, -block_length:] == mask_id
+            if not torch.any(active_block_mask):
+                post_steps += 1
+            if post_steps > max_post_steps:
+                break
+
+            step_info = {"edit": [], "unmask": []} if record_decoding_order else None
+
+            outputs = model(
+                cur_x,
+                attention_mask=cur_attn_mask,
+                position_ids=cur_position_ids,
+            )
+            logits = outputs.logits
+            nfe += 1
+
+            active_logits = logits[:, -block_length:, :]
+            x0, x0_p = model._sample_with_temperature_topk_topp(
+                active_logits, temperature=temperature, top_k=top_k, top_p=top_p
+            )
+
+            # ── Mask-filling: select which masked positions to unmask ──
+            mask_transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+            if active_block_mask.sum() > 0:
+                mask_confidence = torch.where(active_block_mask, x0_p, -torch.inf)
+                high_conf_mask = (
+                    mask_confidence[0] > threshold
+                ) & active_block_mask[0]
+                num_high_confidence = high_conf_mask.sum().item()
+
+                if num_high_confidence >= num_to_transfer:
+                    mask_transfer_index[0] = high_conf_mask
+                else:
+                    num_available = active_block_mask.sum().item()
+                    if num_available > 0:
+                        _, idx = torch.topk(
+                            mask_confidence[0],
+                            k=min(num_to_transfer, num_available),
+                        )
+                        mask_transfer_index[0, idx] = True
+
+            # ── Editing: optionally replace non-mask, non-prompt tokens ──
+            editing_transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+            non_mask_positions = ~active_block_mask
+            non_prompt_positions = ~prompt_mask_in_block
+            editable_positions = non_mask_positions & non_prompt_positions[None, :]
+            editing_confidence = torch.where(editable_positions, x0_p, -torch.inf)
+            high_conf_editing = (
+                editing_confidence[0] > editing_threshold
+            ) & editable_positions[0]
+
+            token_changed = x0[0] != old_block_tokens[0]
+            editing_transfer_index[0] = high_conf_editing & token_changed
+            final_transfer_index = mask_transfer_index | editing_transfer_index
+
+            if final_transfer_index.any():
+                cur_x[:, -block_length:][final_transfer_index] = x0[final_transfer_index]
+
+            if record_decoding_order:
+                base_abs = block_start_pos
+                # Record mask-filling positions
+                for pos in mask_transfer_index[0].nonzero(as_tuple=True)[0].tolist():
+                    abs_pos = base_abs + pos
+                    step_info["unmask"].append(int(abs_pos))
+                # Record editing positions
+                for pos in editing_transfer_index[0].nonzero(as_tuple=True)[0].tolist():
+                    abs_pos = base_abs + pos
+                    old_tok = int(old_block_tokens[0, pos].item())
+                    new_tok = int(x0[0, pos].item())
+                    step_info["edit"].append((abs_pos, old_tok, new_tok))
+                decoding_order.append(step_info)
+
+            if active_block_mask.sum() == 0 and not editing_transfer_index.any():
+                break
+
+        x[:, :current_window_end] = cur_x
+        if eos_early_stop:
+            generated_part = x[0, prompt_length:current_window_end]
+            if (generated_part == mask_id).sum() == 0:
+                eos_positions = (generated_part == eos_id).nonzero(as_tuple=True)[0]
+                if len(eos_positions) > 0:
+                    break
+
+    # ── Extract generated tokens ──
+    generated_answer = x[:, : prompt_length + gen_length]
+    eos_positions = (generated_answer[0][input_ids.shape[1] :] == eos_id).nonzero(
+        as_tuple=True
+    )[0]
+    if len(eos_positions) > 0:
+        first_eos_position = eos_positions[0].item()
+    else:
+        first_eos_position = gen_length
+
+    result = generated_answer[
+        :, input_ids.shape[1] : input_ids.shape[1] + first_eos_position + 1
+    ]
+
+    stats = {"nfe": nfe}
+    if record_decoding_order:
+        stats["decoding_order"] = decoding_order
+    return result, stats
 
 
 # ── SSD (Self-Speculative Decoding) helpers ──
@@ -453,19 +674,19 @@ def generate_ssd_policy(
     inputs,
     temperature=0.0,
     block_length=32,
-    steps=32,
+    # steps=32,
     gen_length=2048,
     top_p=None,
     top_k=None,
     eos_early_stop=False,
     eos_id=156892,
     mask_id=156895,
-    threshold=0.5,
-    editing_threshold=0.0,
+    threshold=0.95,
+    editing_threshold=0.9,
     min_ssd_span_length=1,
     legacy_ssd_span_strategy=False,
     ssd_ratio_tempering_factor=1.0,
-    return_forward_stats=False,
+    record_decoding_order=False,
     # Policy selection
     do_verify_policy="mask_span_length",
     # Score-based policy parameters
@@ -478,6 +699,10 @@ def generate_ssd_policy(
     token_acceptance_estimator="hard_margin_threshold",
     ssd_confidence_margin_threshold=0.05,
     ssd_entropy_temperature=1.0,
+    num_to_transfer=1,
+    max_post_steps=16,
+    # minimal_topk=1,
+    **kwargs,
 ):
     """
     Generate text using Self-Speculative Decoding (SSD) with KV cache.
@@ -516,7 +741,7 @@ def generate_ssd_policy(
         legacy_ssd_span_strategy: If True, mask_span_length policy also requires
             enough high-confidence tokens before skipping verification
         ssd_ratio_tempering_factor: Exponent applied to acceptance ratios
-        return_forward_stats: If True, return (tokens, stats_dict)
+        record_decoding_order: If True, also record per-step decoding_order
         do_verify_policy: Policy for deciding whether to run the 2L verifier
         do_verify_score_threshold: Threshold for score_threshold policy
         hysteresis_threshold_on: Turn-on threshold for score_hysteresis policy
@@ -528,9 +753,9 @@ def generate_ssd_policy(
         ssd_entropy_temperature: Temperature for soft_entropy_negexp
 
     Returns:
-        tensor: Generated token IDs (prompt + generated up to first EOS).
-        If return_forward_stats is True, returns (tensor, dict) where dict contains
-        "total_forward_steps" and "decoding_order".
+        tuple: (tensor, stats_dict) where tensor is generated token IDs and
+        stats_dict always contains "nfe" (number of forward evaluations).
+        When record_decoding_order is True, stats_dict also contains "decoding_order".
     """
     input_ids = inputs.to(model.device)
     prompt_length = input_ids.shape[1]
@@ -554,10 +779,8 @@ def generate_ssd_policy(
     prefill_length = prefill_blocks * block_length
 
     past_key_values = DynamicCache()
-    total_forward_steps = 0
-    decoding_order = [] if return_forward_stats else None
-
-    num_transfer_tokens = _get_num_transfer_tokens(block_length, steps)
+    nfe = 0
+    decoding_order = [] if record_decoding_order else None
 
     hysteresis_state = None
     if do_verify_policy == "score_hysteresis":
@@ -576,7 +799,7 @@ def generate_ssd_policy(
             use_cache=True,
             store_kv=True,
         )
-        total_forward_steps += 1
+        nfe += 1
 
     # ── Decode stage ──
     for num_block in range(prefill_blocks, num_blocks):
@@ -594,22 +817,16 @@ def generate_ssd_policy(
             prompt_end_in_block = min(prompt_length - block_start, block_length)
             prompt_mask_in_block[:prompt_end_in_block] = True
 
-        for step in range(steps + 1):
+        post_steps = 0
+        while True:
+            old_block_tokens = cur_x.clone()
             mask_index = (cur_x == mask_id)
-            if mask_index.sum() == 0:
-                # All unmasked — commit KV and move to next block
-                model(
-                    cur_x,
-                    attention_mask=None,
-                    position_ids=cur_position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    store_kv=True,
-                )
-                total_forward_steps += 1
+            if not torch.any(mask_index):
+                post_steps += 1
+            if post_steps > max_post_steps:
                 break
 
-            old_block_tokens = cur_x.clone()
+            step_info = {"edit": [], "unmask": []} if record_decoding_order else None
 
             # ── Draft forward ──
             logits = model(
@@ -620,17 +837,16 @@ def generate_ssd_policy(
                 use_cache=True,
                 store_kv=False,
             ).logits
-            total_forward_steps += 1
+            nfe += 1
 
             x0, x0_p = model._sample_with_temperature_topk_topp(
                 logits, temperature=temperature, top_k=top_k, top_p=top_p
             )
 
-            min_k = min(int(num_transfer_tokens[step]), int(mask_index.sum().item())) if step < len(num_transfer_tokens) else int(mask_index.sum().item())
+            min_k = min(num_to_transfer, int(mask_index.sum().item()))
             decoded_this_step = 0
             transfer_index = torch.zeros_like(cur_x, dtype=torch.bool)
             update_tokens = cur_x.clone()
-            step_info = {"edit": [], "unmask": []} if return_forward_stats else None
 
             # ── Editing: replace non-mask, non-prompt tokens (before SSD) ──
             editing_transfer_index = torch.zeros_like(x0, dtype=torch.bool)
@@ -648,7 +864,7 @@ def generate_ssd_policy(
                 transfer_index |= editing_transfer_index
                 update_tokens[editing_transfer_index] = x0[editing_transfer_index]
 
-                if return_forward_stats:
+                if record_decoding_order:
                     base_abs = block_start
                     for pos in editing_transfer_index[0].nonzero(as_tuple=True)[0].tolist():
                         abs_pos = base_abs + pos
@@ -733,7 +949,7 @@ def generate_ssd_policy(
                     use_cache=True,
                     store_kv=False,
                 ).logits
-                total_forward_steps += 1
+                nfe += 1
 
                 # Rejection sampling over the first mask span
                 q_logits = verify_logits[0, span_rel_t + L, :]  # (S, V) from masked half
@@ -781,14 +997,14 @@ def generate_ssd_policy(
 
                     decoded_this_step += len(update_rel)
 
-                    if return_forward_stats:
+                    if record_decoding_order:
                         base_abs = block_start
                         for r in update_rel:
                             abs_pos = base_abs + int(r)
                             if first_reject is not None and r == span_rel[first_reject]:
-                                step_info["unmask"].append(float(abs_pos) + 0.5)
+                                step_info["unmask"].append(-float(abs_pos) - 0.5)
                             else:
-                                step_info["unmask"].append(int(abs_pos))
+                                step_info["unmask"].append(-int(abs_pos))
 
             # ── Fallback mask-filling: if SSD didn't decode enough ──
             if decoded_this_step < min_k:
@@ -811,16 +1027,19 @@ def generate_ssd_policy(
                 update_tokens[fallback_index] = x0[fallback_index]
                 decoded_this_step += int(fallback_index.sum().item())
 
-                if return_forward_stats:
+                if record_decoding_order:
                     base_abs = block_start
                     for r in fallback_index[0].nonzero(as_tuple=True)[0].tolist():
-                        step_info["unmask"].append(-int(base_abs + r))
+                        step_info["unmask"].append(int(base_abs + r))
 
             # Apply updates
             cur_x[transfer_index] = update_tokens[transfer_index]
 
-            if return_forward_stats:
+            if record_decoding_order:
                 decoding_order.append(step_info)
+
+            if mask_index.sum() == 0 and not editing_transfer_index.any():
+                break
 
         x[:, block_start:block_end] = cur_x
 
@@ -832,9 +1051,8 @@ def generate_ssd_policy(
                 if len(eos_positions) > 0:
                     break
 
-        # Commit KV for next block (if not last and not already committed)
-        if num_block < num_blocks - 1 and not (mask_index.sum() == 0):
-            # mask_index.sum()==0 means we already committed inside the loop
+        # Commit KV for next block
+        if num_block < num_blocks - 1:
             model(
                 cur_x,
                 attention_mask=None,
@@ -843,7 +1061,7 @@ def generate_ssd_policy(
                 use_cache=True,
                 store_kv=True,
             )
-            total_forward_steps += 1
+            nfe += 1
 
     # ── Extract generated tokens ──
     generated_answer = x[:, :prompt_length + gen_length]
@@ -855,9 +1073,7 @@ def generate_ssd_policy(
 
     result = generated_answer[:, input_ids.shape[1]:input_ids.shape[1] + first_eos_position + 1]
 
-    if return_forward_stats:
-        return result, {
-            "total_forward_steps": total_forward_steps,
-            "decoding_order": decoding_order,
-        }
-    return result
+    stats = {"nfe": nfe}
+    if record_decoding_order:
+        stats["decoding_order"] = decoding_order
+    return result, stats
