@@ -131,9 +131,10 @@ def main(args):
 
     t1 = time.perf_counter()
 
-    # Decode output
-    output_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-    num_generated = generated_tokens.shape[1]
+    # Decode output (generated_tokens includes prompt)
+    prompt_len = input_ids.shape[1]
+    output_text = tokenizer.decode(generated_tokens[0, prompt_len:], skip_special_tokens=True)
+    num_generated = generated_tokens.shape[1] - prompt_len
 
     print(f"\n=== Output ===")
     print(output_text)
@@ -146,7 +147,6 @@ def main(args):
     if "decoding_order" in stats:
         print(f"Decoding steps: {len(stats['decoding_order'])}")
 
-        prompt_len = input_ids.shape[1]
         gen_ids = generated_tokens[0].tolist()
 
         # Print position ordering per step

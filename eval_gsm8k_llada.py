@@ -354,7 +354,8 @@ def main():
             )
             total_nfe += stats["nfe"]
 
-            out_text = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+            # generated_tokens includes prompt; slice it off for answer extraction
+            out_text = tokenizer.decode(generated_tokens[0, input_ids.shape[1]:], skip_special_tokens=True)
             pred_num = extract_predicted_answer(out_text)
             batch_model_answers.append({"text": out_text, "numeric": pred_num})
 

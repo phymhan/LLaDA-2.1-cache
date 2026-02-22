@@ -94,9 +94,9 @@ def generate_cached(
 
     Returns:
         If return_stats is True (default): (tensor, stats_dict) where tensor is
-        generated token IDs and stats_dict contains "nfe". When record_decoding_order
-        is True, stats_dict also contains "decoding_order".
-        If return_stats is False: tensor of generated token IDs only.
+        input + generated token IDs (prompt included) and stats_dict contains "nfe".
+        When record_decoding_order is True, stats_dict also contains "decoding_order".
+        If return_stats is False: tensor only.
     """
     if max_gen_toks is not None:
         gen_length = max_gen_toks
@@ -275,7 +275,7 @@ def generate_cached(
         first_eos_position = gen_length
 
     result = generated_answer[
-        :, input_ids.shape[1] : input_ids.shape[1] + first_eos_position + 1
+        :, : input_ids.shape[1] + first_eos_position + 1
     ]
 
     if not return_stats:
@@ -336,9 +336,9 @@ def generate(
 
     Returns:
         If return_stats is True (default): (tensor, stats_dict) where tensor is
-        generated token IDs and stats_dict contains "nfe". When record_decoding_order
-        is True, stats_dict also contains "decoding_order".
-        If return_stats is False: tensor of generated token IDs only.
+        input + generated token IDs (prompt included) and stats_dict contains "nfe".
+        When record_decoding_order is True, stats_dict also contains "decoding_order".
+        If return_stats is False: tensor only.
     """
     if max_gen_toks is not None:
         gen_length = max_gen_toks
@@ -478,7 +478,7 @@ def generate(
         first_eos_position = gen_length
 
     result = generated_answer[
-        :, input_ids.shape[1] : input_ids.shape[1] + first_eos_position + 1
+        :, : input_ids.shape[1] + first_eos_position + 1
     ]
 
     if not return_stats:
@@ -777,9 +777,9 @@ def generate_ssd_policy(
 
     Returns:
         If return_stats is True (default): (tensor, stats_dict) where tensor is
-        generated token IDs and stats_dict contains "nfe". When record_decoding_order
-        is True, stats_dict also contains "decoding_order".
-        If return_stats is False: tensor of generated token IDs only.
+        input + generated token IDs (prompt included) and stats_dict contains "nfe".
+        When record_decoding_order is True, stats_dict also contains "decoding_order".
+        If return_stats is False: tensor only.
     """
     if max_gen_toks is not None:
         gen_length = max_gen_toks
@@ -1097,7 +1097,7 @@ def generate_ssd_policy(
     else:
         first_eos_position = gen_length
 
-    result = generated_answer[:, input_ids.shape[1]:input_ids.shape[1] + first_eos_position + 1]
+    result = generated_answer[:, :input_ids.shape[1] + first_eos_position + 1]
 
     if not return_stats:
         return result
