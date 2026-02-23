@@ -12,7 +12,7 @@ Experiment grid:
   - score_threshold: th x {dyn c1, sta c1/c2/c4}
   - score_hysteresis: (on, off) pairs
 
-Each run produces two commands: GSM8K eval + MBPP eval (lm_eval).
+Each run produces two commands: GSM8K eval + MBPP eval.
 """
 
 from __future__ import annotations
@@ -24,8 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Set, Tuple
 
-MODEL = "inclusionAI/LLaDA2.1-mini"
-CUSTOM_MODEL_CLASS = "./modeling_llada2_moe_cache.py:LLaDA2MoeModelLM"
 BLOCK_LENGTH = 32
 
 
@@ -210,40 +208,28 @@ def build_gsm8k_cmd(
 def build_mbpp_cmd(
     gpu_id: str,
     run: RunConfig,
-    model: str,
-    custom_model_class: str,
-    max_gen_toks: int,
-    output_root: str,
+    python_bin: str,
+    eval_script: str,
+    sample_n: int,
+    gen_length: int,
+    summary_file: str,
 ) -> str:
-    fn_name = {"cached": "generate_cached", "ssd_policy": "generate_ssd_policy"}[run.generate_fn]
-    custom_generate = f"./generate_utils.py:{fn_name}"
-    model_args = [
-        f"pretrained={model}",
-        "trust_remote_code=True",
-        f"custom_model_class={custom_model_class}",
-        f"custom_generate={custom_generate}",
-        f"block_length={run.block_length}",
-        f"threshold={_fmt_num(run.threshold)}",
-        f"editing_threshold={_fmt_num(run.editing_threshold)}",
-        f"max_post_steps={run.max_post_steps}",
-        f"max_gen_toks={max_gen_toks}",
-        "return_stats=false",
-    ]
-    model_args.extend(run.policy_model_args)
-
-    output_subdir = "cached" if run.generate_fn == "cached" else "ssd"
     parts = [
         f"CUDA_VISIBLE_DEVICES={gpu_id}",
-        "HF_ALLOW_CODE_EVAL=1",
-        "lm_eval",
-        "--model", "hf",
-        "--model_args", ",".join(model_args),
-        "--batch_size", "1",
-        "--tasks", "mbpp",
-        "--confirm_run_unsafe_code",
-        "--log_samples",
-        "--output_path", f"{output_root}/{output_subdir}/{run.config_str}",
+        python_bin, eval_script,
+        "--sample_n", str(sample_n),
+        "--generate_fn", run.generate_fn,
+        "--gen_length", str(gen_length),
+        "--block_length", str(run.block_length),
+        "--threshold", _fmt_num(run.threshold),
+        "--editing_threshold", _fmt_num(run.editing_threshold),
+        "--max_post_steps", str(run.max_post_steps),
     ]
+    parts.extend(run.policy_cli_args)
+    parts.extend([
+        "--summary_file", summary_file,
+        "--config_str", f'"{run.config_str}"',
+    ])
     return " ".join(parts)
 
 
@@ -284,11 +270,8 @@ def write_sh(path: Path, cmds: Sequence[Tuple[str, str]]) -> None:
 
 # ── Scan existing results ──
 
-MODEL_DIR_NAME = "inclusionAI__LLaDA2.1-mini"
-
-
-def scan_existing_gsm8k(roots: Sequence[str], summary_file: str) -> Set[str]:
-    """Scan directories for existing GSM8K configs in summary JSONL files."""
+def _scan_existing_summary(roots: Sequence[str], summary_file: str) -> Set[str]:
+    """Scan directories for existing configs in summary JSONL files."""
     configs: Set[str] = set()
     for root in roots:
         for suffix in [".jsonl", "_ssd.jsonl", "_cached.jsonl"]:
@@ -309,21 +292,14 @@ def scan_existing_gsm8k(roots: Sequence[str], summary_file: str) -> Set[str]:
     return configs
 
 
-def scan_existing_mbpp(roots: Sequence[str], output_root: str, model_dir_name: str = MODEL_DIR_NAME) -> Set[str]:
-    """Scan directories for existing MBPP configs (has results_*.json)."""
-    configs: Set[str] = set()
-    for root in roots:
-        for subdir in ["cached", "ssd"]:
-            d = Path(root) / output_root / subdir
-            if not d.is_dir():
-                continue
-            for cfg_dir in d.iterdir():
-                if not cfg_dir.is_dir():
-                    continue
-                model_dir = cfg_dir / model_dir_name
-                if model_dir.is_dir() and list(model_dir.glob("results_*.json")):
-                    configs.add(cfg_dir.name)
-    return configs
+def scan_existing_gsm8k(roots: Sequence[str], summary_file: str) -> Set[str]:
+    """Scan directories for existing GSM8K configs in summary JSONL files."""
+    return _scan_existing_summary(roots, summary_file)
+
+
+def scan_existing_mbpp(roots: Sequence[str], summary_file: str) -> Set[str]:
+    """Scan directories for existing MBPP configs in summary JSONL files."""
+    return _scan_existing_summary(roots, summary_file)
 
 
 # ── Main ──
@@ -349,14 +325,14 @@ def main():
     parser.add_argument("--gsm8k_summary_file", type=str, default="summary/gsm8k")
 
     # MBPP settings
-    parser.add_argument("--model", type=str, default=MODEL)
-    parser.add_argument("--custom_model_class", type=str, default=CUSTOM_MODEL_CLASS)
-    parser.add_argument("--mbpp_max_gen_toks", type=int, default=512)
-    parser.add_argument("--mbpp_output_root", type=str, default="results")
+    parser.add_argument("--mbpp_eval_script", type=str, default="eval_mbpp_llada.py")
+    parser.add_argument("--mbpp_sample_n", type=int, default=500)
+    parser.add_argument("--mbpp_gen_length", type=int, default=512)
+    parser.add_argument("--mbpp_summary_file", type=str, default="summary/mbpp")
 
     # Skip existing results
     parser.add_argument("--existing_roots", type=str, nargs="*", default=None,
-                        help="Directories with existing results to skip (scans summary JSONL and MBPP result dirs)")
+                        help="Directories with existing results to skip (scans summary JSONL files)")
     parser.add_argument("--rerun_mbpp", action="store_true",
                         help="Always generate MBPP commands even if results exist")
 
@@ -370,7 +346,7 @@ def main():
     if args.existing_roots:
         existing_gsm8k = scan_existing_gsm8k(args.existing_roots, args.gsm8k_summary_file)
         if not args.rerun_mbpp:
-            existing_mbpp = scan_existing_mbpp(args.existing_roots, args.mbpp_output_root)
+            existing_mbpp = scan_existing_mbpp(args.existing_roots, args.mbpp_summary_file)
         if existing_gsm8k:
             print(f"Found {len(existing_gsm8k)} existing GSM8K configs (will skip)")
         if existing_mbpp:
@@ -400,8 +376,9 @@ def main():
             all_cmds.append((
                 build_mbpp_cmd(
                     gpu_id="__GPU__", run=run,
-                    model=args.model, custom_model_class=args.custom_model_class,
-                    max_gen_toks=args.mbpp_max_gen_toks, output_root=args.mbpp_output_root,
+                    python_bin=args.python_bin, eval_script=args.mbpp_eval_script,
+                    sample_n=args.mbpp_sample_n, gen_length=args.mbpp_gen_length,
+                    summary_file=args.mbpp_summary_file,
                 ),
                 f"mbpp {run.config_str}",
             ))

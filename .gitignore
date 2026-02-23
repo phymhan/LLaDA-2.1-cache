@@ -1,1 +1,7 @@
 __pycache__/
+references/
+results*/
+summary*/
+compiled*/
+runs*/
+*.zip

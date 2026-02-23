@@ -7,14 +7,14 @@
 python eval_gsm8k_llada.py --sample_n 500 --generate_fn ssd_policy --gen_length 512 --block_length 32 --threshold 0.95 --editing_threshold 0.9 --max_post_steps 0 --do_verify_policy mask_span_length --min_ssd_span_length 8 --summary_file summary/gsm8k --config_str "ssd_b32_tm0.95_te0.9_policy=span_span=8"
 ```
 
-### lm-eval (MBPP) — SSD
+### MBPP — SSD
 ```bash
-CUDA_VISIBLE_DEVICES=0 HF_ALLOW_CODE_EVAL=1 lm_eval --model hf --model_args pretrained=inclusionAI/LLaDA2.1-mini,trust_remote_code=True,custom_model_class=./modeling_llada2_moe_cache.py:LLaDA2MoeModelLM,custom_generate=./generate_utils.py:generate_ssd_policy,block_length=32,threshold=0.95,editing_threshold=0.9,max_post_steps=0,max_gen_toks=512,return_stats=false,do_verify_policy=mask_span_length,min_ssd_span_length=8 --batch_size 1 --tasks mbpp --confirm_run_unsafe_code --log_samples --output_path results/ssd/ssd_b32_tm0.95_te0.9_policy=span_span=8
+python eval_mbpp_llada.py --sample_n 500 --generate_fn ssd_policy --gen_length 512 --block_length 32 --threshold 0.95 --editing_threshold 0.9 --max_post_steps 0 --do_verify_policy mask_span_length --min_ssd_span_length 8 --summary_file summary/mbpp --config_str "ssd_b32_tm0.95_te0.9_policy=span_span=8"
 ```
 
-### lm-eval (MBPP) — cached baseline
+### MBPP — cached baseline
 ```bash
-CUDA_VISIBLE_DEVICES=0 HF_ALLOW_CODE_EVAL=1 lm_eval --model hf --model_args pretrained=inclusionAI/LLaDA2.1-mini,trust_remote_code=True,custom_model_class=./modeling_llada2_moe_cache.py:LLaDA2MoeModelLM,custom_generate=./generate_utils.py:generate_cached,block_length=32,threshold=0.95,editing_threshold=0.9,max_post_steps=0,max_gen_toks=512,return_stats=false --batch_size 1 --tasks mbpp --confirm_run_unsafe_code --log_samples --output_path results/cached/cached_b32_tm0.95_te0.9
+python eval_mbpp_llada.py --sample_n 500 --generate_fn cached --gen_length 512 --block_length 32 --threshold 0.95 --editing_threshold 0.9 --max_post_steps 0 --summary_file summary/mbpp --config_str "cached_b32_tm0.95_te0.9"
 ```
 
 ## Sweep experiments
@@ -25,6 +25,13 @@ CUDA_VISIBLE_DEVICES=0 HF_ALLOW_CODE_EVAL=1 lm_eval --model hf --model_args pret
 python gen_sweep_sh.py \
   --name sweep/run \
   --node_gpu_ids "rh01:2,3,4,5,6,7;rh02:0,1,2,3,4,5,6,7;rh04:0,1,2,3,4,5,6,7"
+```
+
+```bash
+python gen_sweep_sh.py \
+    --name sweep/run \
+    --node_gpu_ids "rh01:2,3,4,5,6,7;rh02:0,1,2,3,4,5,6,7;rh04:0,1,2,3,4,5,6,7" \
+    --existing_roots res_rh01 res_rh02 res_rh04
 ```
 
 This generates bash scripts under `runs/sweep/` with one script per GPU:
@@ -69,14 +76,14 @@ bash runs/sweep/run_rh04_7.sh &
 
 Results are written to:
 - GSM8K: `summary/gsm8k.jsonl` (all runs append to the same file)
-- MBPP: `results/cached/{config_str}/` and `results/ssd/{config_str}/`
+- MBPP: `summary/mbpp.jsonl` (all runs append to the same file)
 
 ### 3. Compile results into tables
 
 ```bash
 python compile_sweep_tables.py \
   --gsm8k_summary summary/gsm8k.jsonl \
-  --mbpp_result_roots results \
+  --mbpp_summary summary/mbpp.jsonl \
   --out compiled/sweep_results.md
 ```
 

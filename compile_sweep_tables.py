@@ -24,8 +24,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-MODEL_DIR_NAME = "inclusionAI__LLaDA2.1-mini"
-MBPP_METRIC = "pass_at_1,none"
 SPEEDUP_BASELINE_CFG = "cached_b1_tm1_te0.9"
 
 POLICY_ORDER = ["mask_span_length", "score_threshold", "score_hysteresis"]
@@ -185,36 +183,30 @@ def load_gsm8k(summary_paths: Sequence[Path]) -> Dict[str, Cell]:
     return data
 
 
-def load_mbpp(result_roots: Sequence[Path], model_dir_name: str) -> Dict[str, Cell]:
-    """Load MBPP results from lm_eval output dirs. Returns {config_str: Cell}."""
+def load_mbpp(summary_paths: Sequence[Path]) -> Dict[str, Cell]:
+    """Load MBPP results from summary JSONL files. Returns {config_str: Cell}."""
     data: Dict[str, Cell] = {}
-    for root in result_roots:
-        for subdir in ["cached", "ssd"]:
-            d = root / subdir
-            if not d.is_dir():
-                continue
-            for cfg_dir in d.iterdir():
-                if not cfg_dir.is_dir():
+    for p in summary_paths:
+        if not p.exists():
+            continue
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
-                cfg = cfg_dir.name
-                model_dir = cfg_dir / model_dir_name
-                if not model_dir.is_dir():
-                    continue
-                files = sorted(model_dir.glob("results_*.json"))
-                if not files:
-                    continue
-                latest = files[-1]
                 try:
-                    j = json.loads(latest.read_text(encoding="utf-8"))
+                    row = json.loads(line)
                 except Exception:
                     continue
-                acc = None
-                try:
-                    acc = _safe_float(j["results"]["mbpp"][MBPP_METRIC])
-                except Exception:
-                    pass
-                t = _safe_float(j.get("total_evaluation_time_seconds"))
-                cand = Cell(acc=acc, time_s=t)
+                cfg = str(row.get("config", ""))
+                if not cfg:
+                    continue
+                cand = Cell(
+                    acc=_safe_float(row.get("pass_at_1")),
+                    time_s=_safe_float(row.get("eval_seconds")),
+                    nfe=_safe_float(row.get("avg_nfe")),
+                    ts=str(row.get("ts")) if row.get("ts") else None,
+                )
                 data[cfg] = _choose_newer(data.get(cfg), cand)
     return data
 
@@ -413,20 +405,18 @@ def main():
     parser.add_argument("--gsm8k_summary", type=str, nargs="+",
                         default=["summary/gsm8k.jsonl"],
                         help="GSM8K summary JSONL file(s)")
-    parser.add_argument("--mbpp_result_roots", type=str, nargs="+",
-                        default=["results"],
-                        help="Root dir(s) containing cached/ and ssd/ MBPP results")
+    parser.add_argument("--mbpp_summary", type=str, nargs="+",
+                        default=["summary/mbpp.jsonl"],
+                        help="MBPP summary JSONL file(s)")
     parser.add_argument("--out", type=str, default="compiled/sweep_results.md",
                         help="Output markdown path")
-    parser.add_argument("--model_dir_name", type=str, default=MODEL_DIR_NAME,
-                        help="Model directory name in lm_eval output (pretrained with / -> __)")
     parser.add_argument("--acc_digits", type=int, default=1)
     parser.add_argument("--speedup_digits", type=int, default=1)
 
     args = parser.parse_args()
 
     gsm8k_data = load_gsm8k([Path(p) for p in args.gsm8k_summary])
-    mbpp_data = load_mbpp([Path(p) for p in args.mbpp_result_roots], args.model_dir_name)
+    mbpp_data = load_mbpp([Path(p) for p in args.mbpp_summary])
 
     baseline_g = gsm8k_data.get(SPEEDUP_BASELINE_CFG)
     baseline_m = mbpp_data.get(SPEEDUP_BASELINE_CFG)
