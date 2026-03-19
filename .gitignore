@@ -5,3 +5,6 @@ summary*/
 compiled*/
 runs*/
 *.zip
+*.pdf
+*.json
+lm-eval-harness
